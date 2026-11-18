@@ -108,6 +108,100 @@ Two things are worth knowing before using it on a real target:
   this, because it implements the operators as specified. `selftest`
   prints both numbers.
 
+## Integer arithmetic
+
+8-bit weights are not the same as integer arithmetic: the variant above
+dequantizes the weights and multiplies in float, because the activations of
+this network are float and always were. Integer matmuls need the
+activations quantized too, which needs scales, which need calibration.
+[`training/quantize_int8.py`](../training/quantize_int8.py) does that: it
+runs the float model over real questions from `gen2.py`, collects every
+decoding state it passes through, and hands those to onnxruntime's static
+quantizer in `QuantFormat.QOperator`, so the graph gets real
+`QLinearMatMul` operators rather than simulated quantization.
+
+```bash
+cd ../training
+python quantize_int8.py calibrate ../dos/TINY.BIN tiny2_step.onnx tiny2_step_q8.onnx \
+    "--keep-float=logits,*scores,*ctx" --per-tensor
+python quantize_int8.py compare tiny2_step.onnx tiny2_step_q8.onnx ../dos/TINY.BIN
+cd ../cgen && emx-onnx-cgen compile ../training/tiny2_step_q8.onnx \
+    generated_q8/tiny2_step.c --model-name tiny2_step --emit-data-file
+cc -O2 -std=c11 -Wall -o tiny_cgen_q8 tiny_cgen.c generated_q8/*.c -lm
+```
+
+What it costs, measured on 60 questions (the 16 documented ones plus unseen
+wordings from `gen2.py`), counting answers that stay literally the same as
+the float model's:
+
+| how | integer op | weight scales | answers unchanged |
+|---|---|---|---|
+| static, every matmul | QLinearMatMul | per row | 67% |
+| static, logits left in float | QLinearMatMul | per row | 73% |
+| static, logits and attention left in float | QLinearMatMul | per row | 85% |
+| the same, percentile calibration | QLinearMatMul | per row | 73% |
+| the same, per-tensor weight scales | QLinearMatMul | per tensor | 70% |
+| **dynamic, logits left in float** | **MatMulInteger** | **per row** | **97%** |
+
+Three findings from that table are worth keeping:
+
+- **Dynamic quantization wins, and it needs no calibration at all.** The
+  weights keep one scale per row — the way `TINY.BIN` stores them — and the
+  activations are quantized per call from their actual range instead of a
+  range measured once on calibration data. 58 of 60 answers come out
+  literally identical, and the two that differ are rewordings of the same
+  fact (`People there speak English and French.` becomes `They speak
+  English and French.`).
+- **The logits matmul and the attention matmuls are the sensitive ones.**
+  In the static runs, leaving those nine in float lifts agreement from 67%
+  to 85%. The logits go straight into an argmax over 97 letters, so a small
+  shift flips a letter and the answer is worded differently from there on.
+- **Per-row weight scales are what this network wants, and the generator
+  only takes them on some operators.** `QLinearMatMul` and `MatMulInteger`
+  have allowed a per-column scale since opset 10 (same sentence in the v10
+  and v21 spec text), and onnxruntime emits it, but the generator refuses:
+  `QLinearMatMul b_scale must be scalar, got shape (96,)` and
+  `MatMulInteger b_zero_point must be scalar, got shape (96,)`. Its
+  `QGemm`, `MatMulIntegerToFloat` and `DynamicQuantizeMatMul` lowerings do
+  support per-column (`b_scale_per_column` in the sources), so the gap is
+  confined to those two lowerings — worth an issue. Until then: the static
+  path has to go per-tensor (-15 points), and the dynamic path needs the
+  all-zero zero point vectors collapsed to a scalar, which
+  `quantize_int8.py` does on its way out (symmetric weights, so it changes
+  nothing).
+
+### What it buys, and what it does not
+
+```
+60 questions, this machine            answers   weight file   generated .c
+tiny_cgen      float32                 326 ms     1426 KB       115 KB
+tiny_cgen_int8 8-bit weights          1970 ms      292 KB       145 KB
+tiny_cgen_q8   static, QLinearMatMul   638 ms      376 KB       238 KB
+tiny_cgen_dq8  dynamic, MatMulInteger  491 ms      385 KB       201 KB
+```
+
+Both integer builds beat dequantizing the weights on every call by 3-4x,
+and both are slower than plain float32 — on an x86 with an FPU and no SIMD
+in the generated code, which is the least favourable case. The point of
+them is a target where int8 multiply-accumulate is the fast path, or where
+there is no FPU at all.
+
+**It is not an FPU-free build yet.** 24 of the 33 matmuls are integer
+operators; what stays float is the matmuls kept out on purpose, and RMSNorm
+(`ReduceMean`, `Sqrt`, `Div`), `Softmax`, and the residual adds. Those need
+fixed-point replacements (a reciprocal-sqrt approximation and a
+table-driven softmax) before the program runs without a floating point
+unit, and that is not something ONNX quantization does for you.
+
+### Opset
+
+The exports are written for opset 25, which is not the newest (28). The
+reason is onnxruntime 1.32: it has no `DequantizeLinear(28)` kernel, so the
+`--int8` models would not run in it, and the comparisons in this file need
+them to. emx-onnx-cgen compiles opset 28 without complaint. `--opset N` on
+either export picks another one; below 18 the exporter writes `ReduceMean`
+with `axes` as an attribute instead of an input.
+
 ## The hand-written part
 
 [`tiny_cgen.c`](tiny_cgen.c) does only what a host on the other end of a

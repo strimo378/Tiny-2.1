@@ -14,6 +14,10 @@ are stored as, with a DequantizeLinear per table (one scale per row, as in
 TINY.BIN).  The arithmetic stays float32 and the answers do not change; the
 model file goes from 1.5 MB to 0.4 MB.
 
+--opset N writes the graph for another opset (default 21).  21 or later
+is what the quantized path needs: per-channel scales on QLinearMatMul are
+only specified from version 21 on.
+
 The graph takes letter ids [batch, seq] (int64) and returns logits
 [batch, seq, 97].  Batch and sequence length are dynamic; generation is
 done in Python, one letter at a time, as think() in TINY.C does it.
@@ -28,6 +32,15 @@ import numpy as np
 VOCAB = 97          # 0 pad, 1 newline, 2.. the letters ' '..'~'
 CTX = 128           # longest question + answer, in letters
 EPS = 1e-5
+
+# The opset the graphs are written for.  25, not the newest (28), because
+# onnxruntime 1.32 has no DequantizeLinear(28) kernel and the --int8 models
+# would not run in it; emx-onnx-cgen compiles 28 fine.  Nothing here needs
+# an old opset: the spec allows per-column scales on QLinearMatMul and
+# MatMulInteger since v10, so the opset is not what limits the quantized
+# path - see quantize_int8.py.  Operators that changed on the way are built
+# for both forms, see rmsnorm().  --opset N overrides it.
+OPSET = 25
 
 
 def encode(s):
@@ -178,7 +191,12 @@ def export(w, path, q8=False):
 
     def rmsnorm(x, gain, tag):
         sq = node('Mul', [x, x], tag + '/sq')
-        mean = node('ReduceMean', [sq], tag + '/mean', axes=[-1], keepdims=1)
+        if OPSET < 18:                            # axes was an attribute then
+            mean = node('ReduceMean', [sq], tag + '/mean', axes=[-1], keepdims=1)
+        else:                                     # and is an input from 18 on
+            mean = node('ReduceMean',
+                        [sq, const(tag + '/axes', np.array([-1], np.int64))],
+                        tag + '/mean', keepdims=1)
         eps = node('Add', [mean, const(tag + '/eps', np.float32(EPS))], tag + '/eps_add')
         rms = node('Sqrt', [eps], tag + '/rms')
         div = node('Div', [x, rms], tag + '/div')
@@ -263,8 +281,8 @@ def export(w, path, q8=False):
                    % (param_count(w), w.D, w.L, w.H, w.HID,
                       ', 8-bit weights' if q8 else ''))
     model = helper.make_model(graph, producer_name='tiny2-export_onnx',
-                              opset_imports=[helper.make_operatorsetid('', 17)])
-    model.ir_version = 9
+                              opset_imports=[helper.make_operatorsetid('', OPSET)])
+    model.ir_version = 10 if OPSET >= 21 else 9
     checker.check_model(model, full_check=True)
     save(model, path)
     return os.path.getsize(path)
@@ -298,7 +316,12 @@ def export_step(w, path, q8=False):
 
     def rmsnorm(x, gain, tag):
         sq = node('Mul', [x, x], tag + '/sq')
-        mean = node('ReduceMean', [sq], tag + '/mean', axes=[-1], keepdims=1)
+        if OPSET < 18:                            # axes was an attribute then
+            mean = node('ReduceMean', [sq], tag + '/mean', axes=[-1], keepdims=1)
+        else:                                     # and is an input from 18 on
+            mean = node('ReduceMean',
+                        [sq, const(tag + '/axes', np.array([-1], np.int64))],
+                        tag + '/mean', keepdims=1)
         add = node('Add', [mean, const(tag + '/eps', np.float32(EPS))], tag + '/eps_add')
         rms = node('Sqrt', [add], tag + '/rms')
         div = node('Div', [x, rms], tag + '/div')
@@ -384,8 +407,8 @@ def export_step(w, path, q8=False):
                               doc_string='TINY 2 - one letter per call, cache in and'
                                          ' out%s' % (', 8-bit weights' if q8 else ''))
     model = helper.make_model(graph, producer_name='tiny2-export_onnx',
-                              opset_imports=[helper.make_operatorsetid('', 17)])
-    model.ir_version = 9
+                              opset_imports=[helper.make_operatorsetid('', OPSET)])
+    model.ir_version = 10 if OPSET >= 21 else 9
     checker.check_model(model, full_check=True)
     save(model, path)
     return os.path.getsize(path)
@@ -443,6 +466,11 @@ QUESTIONS = ['what is the capital of peru', 'what is 7 times 8', 'spell elephant
 
 
 def main():
+    global OPSET
+    for a in list(sys.argv):
+        if a.startswith('--opset='):
+            OPSET = int(a.split('=', 1)[1])
+            sys.argv.remove(a)
     q8 = '--int8' in sys.argv
     if q8:
         sys.argv.remove('--int8')
@@ -457,8 +485,9 @@ def main():
             here, 'tiny2_step_int8.onnx' if q8 else 'tiny2_step.onnx')
         w = load_weights(src)
         print('read %s: D=%d L=%d H=%d HID=%d' % (os.path.basename(src), w.D, w.L, w.H, w.HID))
-        print('wrote %s, %d bytes%s' % (dst, export_step(w, dst, q8),
-                                        ' (8-bit weights)' if q8 else ''))
+        print('wrote %s, %d bytes, opset %d%s'
+              % (dst, export_step(w, dst, q8), OPSET,
+                 ', 8-bit weights' if q8 else ''))
 
     elif cmd == 'ask-step':
         import onnxruntime as ort
@@ -475,8 +504,9 @@ def main():
         w = load_weights(src)
         print('read %s: D=%d L=%d H=%d HID=%d, %d parameters'
               % (os.path.basename(src), w.D, w.L, w.H, w.HID, param_count(w)))
-        print('wrote %s, %d bytes%s' % (dst, export(w, dst, q8),
-                                        ' (8-bit weights)' if q8 else ''))
+        print('wrote %s, %d bytes, opset %d%s'
+              % (dst, export(w, dst, q8), OPSET,
+                 ', 8-bit weights' if q8 else ''))
 
     elif cmd == 'ask':
         import onnxruntime as ort

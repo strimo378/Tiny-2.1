@@ -90,6 +90,13 @@ which keeps the weights as the 8-bit values `TINY.BIN` stores (one scale
 per row, as `DequantizeLinear`) and shrinks the model from 1.5 MB to
 0.4 MB without changing the arithmetic or the answers.
 
+`training/quantize_int8.py` goes one step further and turns the matmuls into
+integer operators, either statically (calibrated on real questions from
+`gen2.py`) or dynamically (no calibration needed). Quantized activations do
+change the answers: 97% of them stay literally the same in the dynamic
+mode, 67% to 85% in the static one. The numbers and the reasons are in
+`cgen/README.md`.
+
 ## Licence
 
 Code: MIT (`LICENSE`). Three data files derived from public datasets keep

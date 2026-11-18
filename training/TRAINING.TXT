@@ -36,6 +36,19 @@ stored as, with one DequantizeLinear per table (one scale per row, as in
 TINY.BIN). The arithmetic stays float32 and the answers do not change; the
 model file goes from 1.5 MB to 0.4 MB.
 
+quantize_int8.py goes further and quantizes the activations as well, so the
+matmuls become integer operators (QLinearMatMul). That needs calibration,
+which it does by running the float model over real questions from gen2.py:
+  python quantize_int8.py calibrate ../dos/TINY.BIN tiny2_step.onnx out.onnx \
+      "--keep-float=logits,*scores,*ctx" --per-tensor
+  python quantize_int8.py compare tiny2_step.onnx out.onnx ../dos/TINY.BIN
+It also has a dynamic mode, which needs no calibration at all and keeps the
+per-row weight scales:
+  python quantize_int8.py dynamic tiny2_step.onnx tiny2_step_dq8.onnx
+Unlike the weight-only export, quantized activations change the answers:
+97% of them stay literally the same with the dynamic mode, 67-85% with the
+static one. cgen/README.md has the numbers and the reasons.
+
 How TINY 2 was trained: started from the version 1 network (grown from 3 to
 4 layers, middle layer 192 -> 256), 20 minutes on the first new data set,
 15 minutes more, then 150 minutes and another 180 minutes on the full data
