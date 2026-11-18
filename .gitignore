@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 *.onnx
+tiny
+tiny.exe
+*.DMP
+SOUND.LOG
+nul
+out.raw
+/posix/TINY.BIN

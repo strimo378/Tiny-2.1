@@ -17,6 +17,18 @@
 #include <math.h>
 #include <time.h>
 
+/* The full-screen interface is built when TINY_UI is defined: with Turbo C
+   on DOS, or with TINY_POSIX on a POSIX terminal (Cygwin, Linux, macOS),
+   where ../posix/conio_posix.h stands in for conio.h and dos.h.  Without
+   it only the plain text mode is built. */
+#if defined(__TURBOC__) || defined(TINY_POSIX)
+#define TINY_UI 1
+#endif
+
+#ifdef TINY_POSIX
+#include "conio_posix.h"
+#endif
+
 #define VOCAB  97      /* 0 pad, 1 newline, 2.. the letters ' '..'~' */
 #define CTX    128     /* longest question + answer, in letters      */
 #define MAXD   128
@@ -107,8 +119,13 @@ static void load_model(const char *name)
     if (sizeof(float) != 4)
         fail("this compiler has an unusual float size.");
     fp = fopen(name, "rb");
+    if (fp == NULL && getenv("TINY_BIN") != NULL)
+        fp = fopen(getenv("TINY_BIN"), "rb");   /* for case sensitive systems */
     if (fp == NULL)
-        fail("cannot open TINY.BIN. Keep it in the same directory.");
+        fp = fopen("tiny.bin", "rb");
+    if (fp == NULL)
+        fail("cannot open TINY.BIN. Keep it in the same directory,\n"
+             "or put its path in the TINY_BIN environment variable.");
     if (fread(magic, 1, 4, fp) != 4 || memcmp(magic, "TNY2", 4) != 0)
         fail("TINY.BIN is not a version 2 network file.");
     D = read16(fp); L = read16(fp); H = read16(fp); HID = read16(fp);
@@ -287,6 +304,13 @@ static void step(int tok, int p, float *score)
 #define CLOCKS_PER_SEC CLK_TCK
 #endif
 
+/* milliseconds since some point in the past */
+#ifdef TINY_POSIX
+#define TINY_MS() pc_millis()
+#else
+#define TINY_MS() ((long)((double)clock() * 1000.0 / CLOCKS_PER_SEC))
+#endif
+
 #define MAXQ 72                 /* longest question, in letters */
 
 static float score[VOCAB];
@@ -332,11 +356,13 @@ static int pick(void)
 /* Answer question q into out[]. The two callbacks (may be NULL) are told
    about progress through the question and about every new letter.
    Returns the number of letters; *tenths gets the time taken. */
+static long think_ms;                   /* the same time in ms, for the speed */
+
 static int think(const char *q, char *out, long *tenths,
                  void (*on_step)(int i, int n), void (*on_letter)(int c))
 {
     int p = 0, n = (int)strlen(q), tok, letters = 0;
-    clock_t t0 = clock();
+    long t0 = TINY_MS();
 
     for (; q[p]; p++) {
         if (on_step) on_step(p, n);
@@ -351,7 +377,8 @@ static int think(const char *q, char *out, long *tenths,
         step(tok, p, score);
     }
     out[letters] = 0;
-    *tenths = (long)((double)(clock() - t0) * 10.0 / CLOCKS_PER_SEC);
+    think_ms = TINY_MS() - t0;
+    *tenths = think_ms / 100;
     return letters;
 }
 
@@ -423,14 +450,19 @@ static int plain_main(void)
     return 0;
 }
 
-#ifdef __TURBOC__
+#ifdef TINY_UI
 /* ==================================================================
    The DOS screen: Turbo C conio for text, the PC speaker for sound,
-   and on VGA a reprogrammed neon colour palette.
+   and on VGA a reprogrammed neon colour palette.  On POSIX the same
+   code drives a terminal through conio_posix.h.
    ================================================================== */
+#ifdef __TURBOC__
 #include <conio.h>
 #include <dos.h>
 #include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #define SCRW   80
 #define CHAT_L 3                /* chat window, inside its frame */
@@ -464,7 +496,9 @@ static int plain_main(void)
 
 static int mono, vga, neon = 1, sound_on = 1, voice_on = 1, demo, dump, dumpall;
 static int chat_x = 1, chat_y = 1;              /* cursor inside chat window */
+#ifdef __TURBOC__
 static unsigned cursor_shape = 0x0607;
+#endif
 static char last_q[MAXQ + 1];
 static FILE *sndlog;
 static float act_max[MAXL];
@@ -481,6 +515,7 @@ static void color(int a)
     textattr(a);
 }
 
+#ifdef __TURBOC__
 static void cursor(int on)
 {
     union REGS r;
@@ -534,6 +569,13 @@ static void neon_palette(void)
     r.h.bl = 0;
     int86(0x10, &r, &r);
 }
+#else
+/* The same three things on a terminal: hide/show the cursor, ask whether
+   real colours are available, and switch to the neon palette. */
+static void cursor(int on)        { pc_cursor(on); }
+static int has_vga(void)          { return pc_has_truecolor(); }
+static void neon_palette(void)    { pc_neon_palette(); }
+#endif
 
 /* ---- sound ---- */
 
@@ -751,7 +793,7 @@ static void monitor_static(void)
 static void monitor_live(void)
 {
     int l, v, i;
-    char buf[20];
+    char buf[40];
     full();
     for (l = 0; l < L && l < 6; l++) {
         if (layer_act[l] > act_max[l]) act_max[l] = layer_act[l];
@@ -770,7 +812,10 @@ static void monitor_live(void)
         color(v > 800 ? C_ANSWER : v > 500 ? C_QTEXT : C_HOT);
         putch(v > 900 ? 219 : v > 700 ? 178 : v > 450 ? 177 : 176);
     }
-    sprintf(buf, "%ld.%ld letters/s  ", speed10 / 10, speed10 % 10);
+    if (speed10 > 99999L) speed10 = 99999L;     /* keeps the panel line short */
+    sprintf(buf, "%ld.%ld letters/s", speed10 / 10, speed10 % 10);
+    for (i = (int)strlen(buf); i < 19; i++) buf[i] = ' ';   /* clear the rest */
+    buf[19] = 0;
     put_at(MON_X, 15, C_TEXT, buf);
     sprintf(buf, "creativity %d     ", creativity);
     put_at(MON_X, 20, C_TEXT, buf);
@@ -1175,7 +1220,7 @@ static void ask(const char *q)
     if (letters == 0) { ui_letter('.'); out[0] = '.'; out[1] = 0; letters = 1; }
     ans_pos(ans_col - 1, &sx, &sy);              /* last letter stops glowing */
     gotoxy(sx, sy); color(C_ANSWER); putch(scr_prev);
-    speed10 = tenths > 0 ? 100L * letters / tenths : 0;
+    speed10 = think_ms > 0 ? 10000L * letters / think_ms : 0;
     sprintf(info, "%d ltr %ld.%lds", letters, tenths / 10, tenths % 10);
     status_bar(info);
     monitor_live();
@@ -1372,12 +1417,12 @@ int main(int argc, char **argv)
             creativity = argv[i][0] - '0';
         else if (is_word(argv[i], "/p") || is_word(argv[i], "-p"))
             plain = 1;
-#ifdef __TURBOC__
+#ifdef TINY_UI
         else if (is_word(argv[i], "/demo") || is_word(argv[i], "-demo"))
             demo = 1;
-        else if (is_word(argv[i], "/dump"))
+        else if (is_word(argv[i], "/dump") || is_word(argv[i], "-dump"))
             dump = 1;
-        else if (is_word(argv[i], "/dumpall"))
+        else if (is_word(argv[i], "/dumpall") || is_word(argv[i], "-dumpall"))
             dump = dumpall = 1;
         else if (is_word(argv[i], "/mono") || is_word(argv[i], "-mono"))
             mono = 1;
@@ -1388,9 +1433,18 @@ int main(int argc, char **argv)
 #endif
     }
     srand((unsigned)time(NULL));
-#ifdef __TURBOC__
-    if (!plain && isatty(0) && isatty(1))
+#ifdef TINY_UI
+    if (!plain && isatty(0) && isatty(1)) {
+#ifndef __TURBOC__
+        if (!pc_screen_fits()) {
+            printf("TINY: the full screen interface needs a terminal of at least\n"
+                   "80x25 characters. Using plain text mode instead.\n");
+            return plain_main();
+        }
+        pc_begin();
+#endif
         return ui_main();
+    }
 #endif
     return plain_main();
 }
