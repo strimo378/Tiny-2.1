@@ -101,6 +101,10 @@ mode, 67% to 85% in the static one. That is why the dynamic one is what
 `cgen/` builds by default. The numbers and the reasons are in
 `cgen/README.md`.
 
+All six exported models are checked in under `training/`.
+[`training/MODELS.md`](training/MODELS.md) says what each one is, how
+accurate it is against the float32 one, and how to reproduce it.
+
 ## Licence
 
 Code: MIT (`LICENSE`). Three data files derived from public datasets keep

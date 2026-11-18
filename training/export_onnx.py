@@ -14,9 +14,13 @@ are stored as, with a DequantizeLinear per table (one scale per row, as in
 TINY.BIN).  The arithmetic stays float32 and the answers do not change; the
 model file goes from 1.5 MB to 0.4 MB.
 
---opset N writes the graph for another opset (default 21).  21 or later
-is what the quantized path needs: per-channel scales on QLinearMatMul are
-only specified from version 21 on.
+--opset N writes the graph for another opset (default 25).  25 rather than
+the newest 28 because onnxruntime 1.32 has no DequantizeLinear(28) kernel,
+so the --int8 models would not run in it; emx-onnx-cgen compiles 28 fine.
+Below 18 the exporter writes ReduceMean with axes as an attribute.
+
+MODELS.md describes the six models that are checked in, and how good they
+are.
 
 The graph takes letter ids [batch, seq] (int64) and returns logits
 [batch, seq, 97].  Batch and sequence length are dynamic; generation is

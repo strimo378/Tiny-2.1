@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 *.onnx
+# the exported models are checked in, see training/MODELS.md
+!/training/*.onnx
 tiny
 tiny.exe
 *.DMP
