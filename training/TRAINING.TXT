@@ -10,12 +10,22 @@ train2.py       PyTorch training, evaluation and export to TINY.BIN
 geo2.py, extra_facts.py   rebuild geography/element tables from the public
                 mledoze/countries and Periodic-Table-JSON datasets (GitHub)
 tiny2.pt        the trained network (same as TINY.BIN, full precision)
+export_onnx.py  converts the network to ONNX and runs it with onnxruntime
+                (reads dos/TINY.BIN directly, no PyTorch needed)
 
 Continue training and export (needs Python 3 and PyTorch, CPU is fine):
   python3 train2.py train 60 more.pt --resume tiny2.pt --lr 5e-4 --decay 0.3 --eval-every 20
   python3 train2.py eval more.pt
   python3 train2.py export more.pt TINY.BIN
 The same TINY.EXE reads the new TINY.BIN.
+
+Run it on a modern machine (ONNX, needs numpy, onnx and onnxruntime):
+  python -m venv .venv && .venv/bin/pip install numpy onnx onnxruntime
+  python export_onnx.py export ../dos/TINY.BIN tiny2.onnx
+  python export_onnx.py ask tiny2.onnx "what is the capital of peru"
+  python export_onnx.py selftest ../dos/TINY.BIN tiny2.onnx
+The graph takes letter ids [batch, seq] and gives logits [batch, seq, 97];
+export_onnx.py ask does the letter-by-letter decoding.
 
 How TINY 2 was trained: started from the version 1 network (grown from 3 to
 4 layers, middle layer 192 -> 256), 20 minutes on the first new data set,

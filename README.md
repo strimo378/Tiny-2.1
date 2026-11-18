@@ -45,6 +45,26 @@ python3 train2.py export more.pt TINY.BIN         # TINY.EXE reads the new file
 Add your own facts to `training/facts/` (format in `training/TRAINING.TXT`).
 Exporting `tiny2.pt` unchanged gives exactly the released `TINY.BIN`.
 
+## Run it on a modern machine (ONNX)
+
+`training/export_onnx.py` converts the network to ONNX. It reads
+`dos/TINY.BIN` directly, so only NumPy, `onnx` and `onnxruntime` are
+needed — no PyTorch.
+
+```
+python -m venv .venv
+.venv/bin/pip install numpy onnx onnxruntime        # Windows: .venv\Scripts\pip
+cd training
+python export_onnx.py export ../dos/TINY.BIN tiny2.onnx
+python export_onnx.py ask tiny2.onnx "what is the capital of peru"
+python export_onnx.py selftest ../dos/TINY.BIN tiny2.onnx
+```
+
+The graph takes letter ids `[batch, seq]` (int64) and returns logits
+`[batch, seq, 97]`; both axes are dynamic. Decoding letter by letter is
+done in Python, the way `think()` in `TINY.C` does it. Pass `tiny2.pt`
+instead of `TINY.BIN` (needs PyTorch) for full-precision weights.
+
 ## Licence
 
 Code: MIT (`LICENSE`). Three data files derived from public datasets keep
