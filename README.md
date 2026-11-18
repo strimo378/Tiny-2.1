@@ -82,8 +82,11 @@ on a terminal.
 
 `cgen/` is the same thing with a generated kernel: the ONNX model is
 compiled to C by [emx-onnx-cgen](https://github.com/emmtrix/emx-onnx-cgen)
-and only the serial console is hand-written. All of them give the same
-answers as `TINY.EXE`.
+and only the serial console is hand-written. Its `make` builds the
+dynamically quantized model, whose matmuls are integer operators;
+`make fp32`, `make static8` and `make weights8` build the other three.
+All of them give the same answers as `TINY.EXE` on the documented
+questions.
 
 The ONNX exports come in two flavours: float32 by default, and `--int8`,
 which keeps the weights as the 8-bit values `TINY.BIN` stores (one scale
@@ -94,7 +97,8 @@ per row, as `DequantizeLinear`) and shrinks the model from 1.5 MB to
 integer operators, either statically (calibrated on real questions from
 `gen2.py`) or dynamically (no calibration needed). Quantized activations do
 change the answers: 97% of them stay literally the same in the dynamic
-mode, 67% to 85% in the static one. The numbers and the reasons are in
+mode, 67% to 85% in the static one. That is why the dynamic one is what
+`cgen/` builds by default. The numbers and the reasons are in
 `cgen/README.md`.
 
 ## Licence

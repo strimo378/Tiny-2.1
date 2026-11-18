@@ -7,10 +7,24 @@ and the only hand-written file is the serial console around it.
 ```bash
 pip install emx-onnx-cgen
 cd cgen
-make generate        # tiny2_step.onnx -> generated/tiny2_step.c + _data.c + .bin
-make
-./tiny_cgen -w generated/tiny2_step.bin
+make                 # export, quantize, generate, compile
+./tiny_cgen -w generated_dq8/tiny2_step.bin
 ```
+
+The default build is the dynamically quantized one: its matmuls are
+integer operators and its weights keep one scale per row, the way
+`TINY.BIN` stores them. Of the four variants it is the closest to the
+float answers and needs no calibration data; [Integer
+arithmetic](#integer-arithmetic) has the numbers. All four:
+
+| target | binary | what it is |
+|---|---|---|
+| `make` | `tiny_cgen` | int8 matmuls, `MatMulInteger`, per-row weight scales |
+| `make fp32` | `tiny_cgen_f32` | float32 weights and arithmetic |
+| `make static8` | `tiny_cgen_q8` | int8 matmuls, `QLinearMatMul`, calibrated |
+| `make weights8` | `tiny_cgen_int8` | 8-bit weights, dequantized before each multiply |
+| `make all` | | all four |
+| `make test` | | five questions through every variant, answers compared |
 
 ```
 > what is the capital of peru
@@ -72,7 +86,7 @@ system.
 
 `TINY.BIN` stores its weights as int8 with one scale per row, and ONNX can
 say exactly that: an int8 initializer plus `DequantizeLinear` with a
-per-axis scale. `make int8` builds that variant.
+per-axis scale. `make weights8` builds that variant.
 
 ```
                             float32            8-bit weights
@@ -113,22 +127,34 @@ Two things are worth knowing before using it on a real target:
 8-bit weights are not the same as integer arithmetic: the variant above
 dequantizes the weights and multiplies in float, because the activations of
 this network are float and always were. Integer matmuls need the
-activations quantized too, which needs scales, which need calibration.
-[`training/quantize_int8.py`](../training/quantize_int8.py) does that: it
+activations quantized too, and that needs scales for them.
+[`training/quantize_int8.py`](../training/quantize_int8.py) gets them two
+ways.
+
+**Dynamically**, which is what the default build uses: the activation
+scales are computed per call from the values actually in flight
+(`DynamicQuantizeLinear` in front of each `MatMulInteger`), so there is
+nothing to calibrate and the weights keep one scale per row.
+
+```bash
+cd ../training
+python quantize_int8.py dynamic tiny2_step.onnx tiny2_step_dq8.onnx
+python quantize_int8.py compare tiny2_step.onnx tiny2_step_dq8.onnx ../dos/TINY.BIN
+```
+
+**Statically**, where the ranges are measured once in advance: the script
 runs the float model over real questions from `gen2.py`, collects every
 decoding state it passes through, and hands those to onnxruntime's static
 quantizer in `QuantFormat.QOperator`, so the graph gets real
 `QLinearMatMul` operators rather than simulated quantization.
 
 ```bash
-cd ../training
-python quantize_int8.py calibrate ../dos/TINY.BIN tiny2_step.onnx tiny2_step_q8.onnx \
-    "--keep-float=logits,*scores,*ctx" --per-tensor
+python quantize_int8.py calibrate ../dos/TINY.BIN tiny2_step.onnx tiny2_step_q8.onnx     "--keep-float=logits,*scores,*ctx" --per-tensor
 python quantize_int8.py compare tiny2_step.onnx tiny2_step_q8.onnx ../dos/TINY.BIN
-cd ../cgen && emx-onnx-cgen compile ../training/tiny2_step_q8.onnx \
-    generated_q8/tiny2_step.c --model-name tiny2_step --emit-data-file
-cc -O2 -std=c11 -Wall -o tiny_cgen_q8 tiny_cgen.c generated_q8/*.c -lm
 ```
+
+`make` and `make static8` run both chains end to end, quantizer and
+generator; the lines above are what they do.
 
 What it costs, measured on 60 questions (the 16 documented ones plus unseen
 wordings from `gen2.py`), counting answers that stay literally the same as
@@ -174,10 +200,10 @@ Three findings from that table are worth keeping:
 
 ```
 60 questions, this machine            answers   weight file   generated .c
-tiny_cgen      float32                 326 ms     1426 KB       115 KB
-tiny_cgen_int8 8-bit weights          1970 ms      292 KB       145 KB
+tiny_cgen      dynamic, MatMulInteger  491 ms      385 KB       201 KB  (default)
+tiny_cgen_f32  float32                 326 ms     1426 KB       115 KB
 tiny_cgen_q8   static, QLinearMatMul   638 ms      376 KB       238 KB
-tiny_cgen_dq8  dynamic, MatMulInteger  491 ms      385 KB       201 KB
+tiny_cgen_int8 8-bit weights          1970 ms      292 KB       145 KB
 ```
 
 Both integer builds beat dequantizing the weights on every call by 3-4x,
@@ -220,15 +246,17 @@ in `embedded/tiny.c`, which keeps its cache as 8-bit numbers.
 Byte-identical to the hand-written port on 16 questions (creativity 0):
 
 ```bash
-printf '%s\n' "$QUESTIONS" | ./tiny_cgen -q -w generated/tiny2_step.bin > a
+printf '%s\n' "$QUESTIONS" | ./tiny_cgen -q -w generated_dq8/tiny2_step.bin > a
 printf '%s\n' "$QUESTIONS" | ../embedded/tiny -q -f ../dos/TINY.BIN > b
 diff a b     # no output
 ```
 
 `make verify` runs the generator's own check against onnxruntime with
-random inputs, and it reports a difference above its 100 ULP default. That
-is float32 accumulation order, not a wrong result. At the worst element of
-a real decoding step (`new_v_1[2][29][18]`), with the three
+random inputs. On the default model it passes at 59 ULP, because the
+integer matmuls are exact and only the float parts around them can drift.
+On the float32 model it reports a difference above its 100 ULP default.
+That is float32 accumulation order, not a wrong result. At the worst
+element of a real decoding step (`new_v_1[2][29][18]`), with the three
 implementations side by side:
 
 | | |
@@ -245,6 +273,7 @@ letter decisions in the 16 answers it never changes which letter wins.
 
 ```bash
 make verify                                  # random inputs, as the tool does it
+emx-onnx-cgen verify ../training/tiny2_step.onnx      # the float32 model
 emx-onnx-cgen verify ../training/tiny2_step.onnx \
   --test-data-dir <dir> --test-data-inputs-only --runtime onnx-reference
 ```
@@ -255,5 +284,6 @@ emx-onnx-cgen verify ../training/tiny2_step.onnx \
 |---|---|---|
 | `dos/TINY.C` | hand-written C, 8-bit weights and cache | DOS full screen, PC speaker |
 | `embedded/tiny.c` | hand-written C, 8-bit weights and cache | serial console, 488 KB static RAM, no heap |
-| `cgen/` | **generated** from ONNX, float32 | serial console, 786 KB cache + 1.4 MB weights |
-| `cgen/` with `make int8` | **generated** from ONNX, int8 weights dequantized at run time | serial console, 285 KB weights + ~1 MB temporaries |
+| `cgen/` | **generated** from ONNX, int8 matmuls, float32 cache | serial console, 786 KB cache + 385 KB weights |
+| `cgen/` with `make fp32` | **generated** from ONNX, float32 | serial console, 786 KB cache + 1.4 MB weights |
+| `cgen/` with `make weights8` | **generated** from ONNX, int8 weights dequantized at run time | serial console, 285 KB weights + ~1 MB temporaries |
