@@ -65,6 +65,31 @@ The graph takes letter ids `[batch, seq]` (int64) and returns logits
 done in Python, the way `think()` in `TINY.C` does it. Pass `tiny2.pt`
 instead of `TINY.BIN` (needs PyTorch) for full-precision weights.
 
+## Run it as a plain terminal program
+
+`embedded/` is a port of the network to a serial console: read a line,
+answer it, print the answer. No screen handling, no sound, no `conio` —
+C89, no heap, 488 KB of static RAM, `stdio` and `math` only.
+
+```
+cd embedded
+make
+./tiny -f ../dos/TINY.BIN
+```
+
+`posix/` instead keeps the DOS full-screen interface and emulates `conio`
+on a terminal.
+
+`cgen/` is the same thing with a generated kernel: the ONNX model is
+compiled to C by [emx-onnx-cgen](https://github.com/emmtrix/emx-onnx-cgen)
+and only the serial console is hand-written. All of them give the same
+answers as `TINY.EXE`.
+
+The ONNX exports come in two flavours: float32 by default, and `--int8`,
+which keeps the weights as the 8-bit values `TINY.BIN` stores (one scale
+per row, as `DequantizeLinear`) and shrinks the model from 1.5 MB to
+0.4 MB without changing the arithmetic or the answers.
+
 ## Licence
 
 Code: MIT (`LICENSE`). Three data files derived from public datasets keep

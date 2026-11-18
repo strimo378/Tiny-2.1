@@ -27,6 +27,15 @@ Run it on a modern machine (ONNX, needs numpy, onnx and onnxruntime):
 The graph takes letter ids [batch, seq] and gives logits [batch, seq, 97];
 export_onnx.py ask does the letter-by-letter decoding.
 
+  python export_onnx.py export-step ../dos/TINY.BIN tiny2_step.onnx
+One letter per call, with the key/value memory passed in and out, all shapes
+fixed: the form a C code generator wants (see cgen/).
+
+Add --int8 to either export to keep the weights as the 8-bit values they are
+stored as, with one DequantizeLinear per table (one scale per row, as in
+TINY.BIN). The arithmetic stays float32 and the answers do not change; the
+model file goes from 1.5 MB to 0.4 MB.
+
 How TINY 2 was trained: started from the version 1 network (grown from 3 to
 4 layers, middle layer 192 -> 256), 20 minutes on the first new data set,
 15 minutes more, then 150 minutes and another 180 minutes on the full data
