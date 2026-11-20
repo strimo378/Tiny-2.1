@@ -101,7 +101,13 @@ mode, 67% to 85% in the static one. That is why the dynamic one is what
 `cgen/` builds by default. The numbers and the reasons are in
 `cgen/README.md`.
 
-All six exported models are checked in under `training/`.
+The step model also comes in three cache flavours: the cache in and out,
+`--row` for a cache that is only read with this letter's row coming back,
+and `--kv8` for that cache kept as int8 with one scale per head, 112 KB
+instead of 384 KB. The int8 cache costs about one answer in sixty, and
+int8 weights on top of it cost nothing further.
+
+All ten exported models are checked in under `training/`.
 [`training/MODELS.md`](training/MODELS.md) says what each one is, how
 accurate it is against the float32 one, and how to reproduce it.
 

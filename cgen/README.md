@@ -228,6 +228,29 @@ them to. emx-onnx-cgen compiles opset 28 without complaint. `--opset N` on
 either export picks another one; below 18 the exporter writes `ReduceMean`
 with `axes` as an attribute instead of an input.
 
+## The cache, and what it could be
+
+The generated kernel takes the whole cache in and gives the whole updated
+cache back, so the host keeps it twice and the graph copies 384 KB per
+letter. Two exports exist that do better, both of them without a C host
+here yet:
+
+- `export-step --row` gives back only this letter's row and leaves the
+  writing to the caller, so nothing is copied and no second copy is
+  needed. Same answers, same numbers to 2.3e-06.
+- `export-step --kv8` additionally keeps the cache as int8 with one scale
+  per head of every row, the way `embedded/tiny.c` has always kept it:
+  **112 KB instead of 384 KB**, for about one answer in sixty. int8
+  weights on top of that cost nothing further — the errors do not add up.
+
+emx-onnx-cgen compiles the `--kv8` model as it stands (21 operators, 296
+nodes, all shapes static); on a real decoding state the generated C is 84
+ULP from the ONNX reference implementation and 116 from onnxruntime, the
+same accumulation-order story as the table above. What is missing is the
+host: `tiny_cgen.c` declares the kernel with four float32 cache pairs, and
+the int8 interface has eighteen inputs. `../training/MODELS.md` has the
+measurements.
+
 ## The hand-written part
 
 [`tiny_cgen.c`](tiny_cgen.c) does only what a host on the other end of a

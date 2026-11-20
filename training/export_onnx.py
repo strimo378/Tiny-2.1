@@ -8,6 +8,15 @@ installed, tiny2.pt can be given instead for full-precision weights.
   python export_onnx.py ask tiny2.onnx "what is the capital of peru"
   python export_onnx.py selftest ../dos/TINY.BIN tiny2.onnx
   python export_onnx.py export-step ../dos/TINY.BIN tiny2_step.onnx
+  python export_onnx.py export-step --row      (tiny2_step_row.onnx)
+  python export_onnx.py export-step --kv8      (tiny2_step_kv8.onnx)
+  python export_onnx.py compare-step tiny2_step.onnx tiny2_step_row.onnx
+
+--row takes the KV cache as input only and gives the new row out, so the
+graph never copies the cache.  --kv8 keeps that cache as int8 with one
+scale per head of every row, 112 KB instead of 384 KB; it implies --row.
+Both change the interface, not the answers - MODELS.md measures by how
+much.
 
 Add --int8 to either export to keep the weights as the 8-bit values they
 are stored as, with a DequantizeLinear per table (one scale per row, as in
@@ -294,7 +303,7 @@ def export(w, path, q8=False):
 
 
 # ---------------------------------------------------------------- ONNX step graph
-def export_step(w, path, q8=False):
+def export_step(w, path, q8=False, row=False, kv8=False):
     """One letter per call, with the memory of earlier letters passed in and
     out as tensors: the shape an embedded inference engine wants.
 
@@ -305,7 +314,29 @@ def export_step(w, path, q8=False):
 
     Every shape is fixed, so the generated C needs no allocation and the
     work per letter does not grow with the answer.
+
+    With row=True the cache is only read: new_k_<l>, new_v_<l> are just the
+    row of this letter, float32[H, 1, HD], and the caller writes it into its
+    cache at pos (ask_step does).  The attention looks at the rows before pos
+    in the cache and at the new row directly, so the graph never copies the
+    cache - what a target with little fast memory wants: the cache can stay
+    in slow memory and be streamed.
+
+    With kv8=True (which implies row=True) the cache is int8 with one scale
+    per head of every row, the way store() in embedded/tiny.c keeps it:
+
+      past_k_<l>, past_v_<l>    int8[H, CTX, HD]
+      past_ks_<l>, past_vs_<l]  float32[H, 1, CTX]      one scale per row
+      new_k_<l>, new_v_<l>      int8[H, 1, HD]
+      new_ks_<l>, new_vs_<l>    float32[H, 1, 1]
+
+    That is 112 KB instead of 384 KB for the whole cache.  The scales come
+    back out of the arithmetic in two different places: a score reads one
+    cache row only, so its scale factors out of the dot product, while the
+    context sum runs over rows with different scales, so there the scale
+    has to be folded into the softmax weight before the sum.
     """
+    row = row or kv8
     from onnx import TensorProto, checker, helper, numpy_helper, save
 
     init, nodes = [], []
@@ -336,6 +367,26 @@ def export_step(w, path, q8=False):
                     [const(tag + '/q', q), const(tag + '/scale', scale)],
                     tag + '/dq', axis=axis)
 
+    def reduce_max(x, tag):                      # over the last axis
+        if OPSET < 18:                           # axes was an attribute then
+            return node('ReduceMax', [x], tag, axes=[-1], keepdims=1)
+        return node('ReduceMax', [x, const(tag + '/axes', np.array([-1], np.int64))],
+                    tag, keepdims=1)
+
+    def quant_row(x, qname, sname, tag):
+        """One cache row to int8 with one scale per head, as store() in
+        embedded/tiny.c does it: the largest value of the head becomes 127.
+        The scale leaves the graph with the row, so the caller remembers
+        both.  Returns the pair of output names."""
+        big = reduce_max(node('Abs', [x], tag + '/abs'), tag + '/big')      # [H, 1, 1]
+        big = node('Max', [big, const(tag + '/floor', np.float32(1e-20))], tag + '/safe')
+        scale = node('Mul', [big, const(tag + '/step', np.float32(1.0 / 127.0))], sname)
+        q = node('Round', [node('Div', [x, scale], tag + '/div')], tag + '/round')
+        clipped = node('Clip', [q, const(tag + '/lo', np.float32(-127.0)),
+                                const(tag + '/hi', np.float32(127.0))], tag + '/clip')
+        node('Cast', [clipped], qname, to=TensorProto.INT8)
+        return qname, scale
+
     def table(tag, arr, key, transpose):
         if not q8:
             return const(tag + '/w', np.ascontiguousarray(arr.T if transpose else arr))
@@ -347,21 +398,27 @@ def export_step(w, path, q8=False):
         return node('MatMul', [x, table(tag, weight, tag.replace('/', '.'), True)], tag)
 
     H, HD, D = w.H, w.HD, w.D
+    full_shape = [H, CTX, HD]                    # the whole cache, one layer
+    row_shape = [H, 1, HD]                       # the row of one letter
 
     # where in the cache this letter goes, and which places may be looked at
+    # (row: the graph does not write the cache, and the cache holds only the
+    # rows before pos; this letter's row comes in separately)
     ramp = const('ramp', np.arange(CTX, dtype=np.int64))
-    here = node('Cast', [node('Equal', [ramp, 'pos'], 'at_pos')], 'at_pos_f',
-                to=TensorProto.FLOAT)
-    keep = node('Sub', [const('one', np.float32(1.0)), here], 'keep')
-    allowed = node('LessOrEqual', [ramp, 'pos'], 'allowed')
+    if not row:
+        here = node('Cast', [node('Equal', [ramp, 'pos'], 'at_pos')], 'at_pos_f',
+                    to=TensorProto.FLOAT)
+        keep = node('Sub', [const('one', np.float32(1.0)), here], 'keep')
+    allowed = node('Less' if row else 'LessOrEqual', [ramp, 'pos'], 'allowed')
     mask = node('Where', [allowed, const('zero_f', np.float32(0.0)),
                           const('minus_big', np.float32(-1e9))], 'mask')
     mask3 = node('Reshape', [mask, const('mask/shape', np.array([1, 1, CTX], np.int64))],
                  'mask3')
-    here3 = node('Reshape', [here, const('here/shape', np.array([1, CTX, 1], np.int64))],
-                 'here3')
-    keep3 = node('Reshape', [keep, const('keep/shape', np.array([1, CTX, 1], np.int64))],
-                 'keep3')
+    if not row:
+        here3 = node('Reshape', [here, const('here/shape', np.array([1, CTX, 1], np.int64))],
+                     'here3')
+        keep3 = node('Reshape', [keep, const('keep/shape', np.array([1, CTX, 1], np.int64))],
+                     'keep3')
 
     x = node('Add', [node('Gather', [table('emb', w.emb, 'emb', False), 'tok'],
                           'emb/lookup'),
@@ -372,24 +429,84 @@ def export_step(w, path, q8=False):
     to_flat = const('to_flat', np.array([1, D], np.int64))
     inv_sqrt = const('inv_sqrt', np.float32(1.0 / np.sqrt(HD)))
 
+    if row:
+        to_col = const('to_col', np.array([H, HD, 1], np.int64))
+        to_scores = const('to_scores', np.array([H, 1, CTX], np.int64))
+        first = const('slice/first', np.array([0], np.int64))
+        last = const('slice/last', np.array([CTX], np.int64))
+        end = const('slice/end', np.array([CTX + 1], np.int64))
+        axis2 = const('slice/axis', np.array([2], np.int64))
+
+    def row_attention(q, h, b, i, p):
+        """Attention over the cache rows before pos plus the new row, without
+        writing the new row into a copy of the cache."""
+        # without kv8 the row itself is the output; with it, the int8 row is
+        fresh = {n: node('Reshape', [linear(h, b[n], '%s/%s' % (p, n)), to_heads],
+                         '%s/%s/row' % (p, n) if kv8 else 'new_%s_%d' % (n, i))
+                 for n in 'kv'}                                      # [H, 1, HD]
+        if kv8:
+            use, past = {}, {}
+            for n in 'kv':
+                qn, sn = quant_row(fresh[n], 'new_%s_%d' % (n, i),
+                                   'new_%ss_%d' % (n, i), '%s/%s/q8' % (p, n))
+                # this letter is read back the way the next call will see it
+                use[n] = node('Mul', [node('Cast', [qn], '%s/%s/row/back' % (p, n),
+                                           to=TensorProto.FLOAT), sn],
+                              '%s/%s/row/dq' % (p, n))
+                past[n] = node('Cast', ['past_%s_%d' % (n, i)], '%s/past_%s' % (p, n),
+                               to=TensorProto.FLOAT)
+        else:
+            use = fresh
+            past = {n: 'past_%s_%d' % (n, i) for n in 'kv'}
+        qcol = node('Reshape', [q, to_col], p + '/q/col')            # [H, HD, 1]
+        # past_k @ q gives [H, CTX, 1]: the cache is used as it is, not transposed
+        s_past = node('Reshape', [node('MatMul', [past['k'], qcol], p + '/scores_past'),
+                                  to_scores], p + '/scores_past/row')  # [H, 1, CTX]
+        if kv8:      # a score reads one cache row, so its scale factors out
+            s_past = node('Mul', [s_past, 'past_ks_%d' % i], p + '/scores_past/dq')
+        s_past = node('Add', [node('Mul', [s_past, inv_sqrt], p + '/scaled_past'), mask3],
+                      p + '/masked_past')
+        kcol = node('Reshape', [use['k'], to_col], p + '/k/col')
+        s_new = node('Mul', [node('MatMul', [q, kcol], p + '/score_new'), inv_sqrt],
+                     p + '/scaled_new')                               # [H, 1, 1]
+        att = node('Softmax', [node('Concat', [s_past, s_new], p + '/scores', axis=2)],
+                   p + '/att', axis=-1)                               # [H, 1, CTX + 1]
+        att_past = node('Slice', [att, first, last, axis2], p + '/att_past')
+        att_new = node('Slice', [att, last, end, axis2], p + '/att_new')
+        if kv8:      # the context sum runs over rows with different scales,
+                     # so there the scale goes into the weight before the sum
+            att_past = node('Mul', [att_past, 'past_vs_%d' % i], p + '/att_past/dq')
+        return node('Add', [node('MatMul', [att_past, past['v']], p + '/ctx_past'),
+                            node('Mul', [att_new, use['v']], p + '/ctx_new')],
+                    p + '/ctx')                                       # [H, 1, HD]
+
     cache_out = []
     for i, b in enumerate(w.blocks):
         p = 'blk%d' % i
         h = rmsnorm(x, b['n1'], p + '/n1')
         q = node('Reshape', [linear(h, b['q'], p + '/q'), to_heads], p + '/q/heads')
-        kv = {}
-        for n in 'kv':
-            fresh = node('Reshape', [linear(h, b[n], '%s/%s' % (p, n)), to_heads],
-                         '%s/%s/heads' % (p, n))                   # [H, 1, HD]
-            kept = node('Mul', ['past_%s_%d' % (n, i), keep3], '%s/%s/kept' % (p, n))
-            added = node('Mul', [fresh, here3], '%s/%s/added' % (p, n))
-            kv[n] = node('Add', [kept, added], 'new_%s_%d' % (n, i))  # [H, CTX, HD]
-            cache_out.append(kv[n])
+        if row:
+            ctx = row_attention(q, h, b, i, p)
+            for n in 'kv':
+                if kv8:
+                    cache_out.append(('new_%s_%d' % (n, i), TensorProto.INT8, row_shape))
+                    cache_out.append(('new_%ss_%d' % (n, i), TensorProto.FLOAT, [H, 1, 1]))
+                else:
+                    cache_out.append(('new_%s_%d' % (n, i), TensorProto.FLOAT, row_shape))
+        else:
+            kv = {}
+            for n in 'kv':
+                fresh = node('Reshape', [linear(h, b[n], '%s/%s' % (p, n)), to_heads],
+                             '%s/%s/heads' % (p, n))                   # [H, 1, HD]
+                kept = node('Mul', ['past_%s_%d' % (n, i), keep3], '%s/%s/kept' % (p, n))
+                added = node('Mul', [fresh, here3], '%s/%s/added' % (p, n))
+                kv[n] = node('Add', [kept, added], 'new_%s_%d' % (n, i))  # [H, CTX, HD]
+                cache_out.append((kv[n], TensorProto.FLOAT, full_shape))
 
-        kt = node('Transpose', [kv['k']], p + '/kt', perm=[0, 2, 1])   # [H, HD, CTX]
-        s = node('Mul', [node('MatMul', [q, kt], p + '/scores'), inv_sqrt], p + '/scaled')
-        att = node('Softmax', [node('Add', [s, mask3], p + '/masked')], p + '/att', axis=-1)
-        ctx = node('MatMul', [att, kv['v']], p + '/ctx')               # [H, 1, HD]
+            kt = node('Transpose', [kv['k']], p + '/kt', perm=[0, 2, 1])   # [H, HD, CTX]
+            s = node('Mul', [node('MatMul', [q, kt], p + '/scores'), inv_sqrt], p + '/scaled')
+            att = node('Softmax', [node('Add', [s, mask3], p + '/masked')], p + '/att', axis=-1)
+            ctx = node('MatMul', [att, kv['v']], p + '/ctx')               # [H, 1, HD]
         merged = node('Reshape', [ctx, to_flat], p + '/ctx/flat')
         x = node('Add', [x, linear(merged, b['o'], p + '/o')], p + '/res1')
 
@@ -400,16 +517,23 @@ def export_step(w, path, q8=False):
     node('MatMul', [rmsnorm(x, w.nf, 'nf'), table('unemb', w.emb, 'emb', True)],
          'logits')
 
-    shape = [w.H, CTX, w.HD]
-    cache_in = [helper.make_tensor_value_info('past_%s_%d' % (n, i), TensorProto.FLOAT, shape)
-                for i in range(w.L) for n in 'kv']
+    cache_in = []
+    for i in range(w.L):
+        for n in 'kv':
+            cache_in.append(('past_%s_%d' % (n, i),
+                             TensorProto.INT8 if kv8 else TensorProto.FLOAT, full_shape))
+            if kv8:                              # one scale per row of the cache
+                cache_in.append(('past_%ss_%d' % (n, i), TensorProto.FLOAT, [H, 1, CTX]))
     ins = [helper.make_tensor_value_info('tok', TensorProto.INT64, [1]),
-           helper.make_tensor_value_info('pos', TensorProto.INT64, [1])] + cache_in
+           helper.make_tensor_value_info('pos', TensorProto.INT64, [1])]
+    ins += [helper.make_tensor_value_info(*t) for t in cache_in]
     outs = [helper.make_tensor_value_info('logits', TensorProto.FLOAT, [1, VOCAB])]
-    outs += [helper.make_tensor_value_info(o, TensorProto.FLOAT, shape) for o in cache_out]
+    outs += [helper.make_tensor_value_info(*t) for t in cache_out]
     graph = helper.make_graph(nodes, 'tiny2_step', ins, outs, init,
-                              doc_string='TINY 2 - one letter per call, cache in and'
-                                         ' out%s' % (', 8-bit weights' if q8 else ''))
+                              doc_string='TINY 2 - one letter per call, %scache in and %s%s'
+                                         % ('int8 ' if kv8 else '',
+                                            'the new row out' if row else 'out',
+                                            ', 8-bit weights' if q8 else ''))
     model = helper.make_model(graph, producer_name='tiny2-export_onnx',
                               opset_imports=[helper.make_operatorsetid('', OPSET)])
     model.ir_version = 10 if OPSET >= 21 else 9
@@ -420,10 +544,9 @@ def export_step(w, path, q8=False):
 
 def ask_step(session, question, w, maxlen=CTX):
     """Greedy answer through the step model, the way the C program does it."""
-    feed = {}
-    for i in range(w.L):
-        for n in 'kv':
-            feed['past_%s_%d' % (n, i)] = np.zeros((w.H, CTX, w.HD), np.float32)
+    kinds = {'tensor(float)': np.float32, 'tensor(int8)': np.int8}
+    feed = {i.name: np.zeros(i.shape, kinds[i.type]) for i in session.get_inputs()
+            if i.name.startswith('past_')}
     names = [o.name for o in session.get_outputs()][1:]
     ids = encode(question + chr(10))
     out, logits = [], None
@@ -440,7 +563,13 @@ def ask_step(session, question, w, maxlen=CTX):
         res = session.run(None, feed)
         logits = res[0][0]
         for name, value in zip(names, res[1:]):
-            feed['past' + name[3:]] = value
+            dst = feed['past' + name[3:]]
+            if value.shape == dst.shape:         # the whole updated cache
+                feed['past' + name[3:]] = value
+            elif value.shape[-1] == 1:           # this row's scale per head
+                dst[:, :, pos] = value[:, :, 0]
+            else:                                # the row of this letter only
+                dst[:, pos, :] = value[:, 0, :]
     return decode(out)
 
 
@@ -478,6 +607,13 @@ def main():
     q8 = '--int8' in sys.argv
     if q8:
         sys.argv.remove('--int8')
+    row = '--row' in sys.argv
+    if row:
+        sys.argv.remove('--row')
+    kv8 = '--kv8' in sys.argv
+    if kv8:
+        sys.argv.remove('--kv8')
+        row = True
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''
     here = os.path.dirname(os.path.abspath(__file__))
     default_bin = os.path.normpath(os.path.join(here, os.pardir, 'dos', 'TINY.BIN'))
@@ -486,12 +622,27 @@ def main():
     if cmd == 'export-step':
         src = sys.argv[2] if len(sys.argv) > 2 else default_bin
         dst = sys.argv[3] if len(sys.argv) > 3 else os.path.join(
-            here, 'tiny2_step_int8.onnx' if q8 else 'tiny2_step.onnx')
+            here, 'tiny2_step%s%s%s.onnx' % ('_row' if row and not kv8 else '',
+                                             '_kv8' if kv8 else '',
+                                             '_int8' if q8 else ''))
         w = load_weights(src)
         print('read %s: D=%d L=%d H=%d HID=%d' % (os.path.basename(src), w.D, w.L, w.H, w.HID))
-        print('wrote %s, %d bytes, opset %d%s'
-              % (dst, export_step(w, dst, q8), OPSET,
-                 ', 8-bit weights' if q8 else ''))
+        print('wrote %s, %d bytes, opset %d%s%s%s'
+              % (dst, export_step(w, dst, q8, row, kv8), OPSET,
+                 ', 8-bit weights' if q8 else '', ', new row out' if row else '',
+                 ', int8 cache' if kv8 else ''))
+
+    elif cmd == 'compare-step':
+        import onnxruntime as ort
+        a, b = sys.argv[2], sys.argv[3]
+        w = load_weights(sys.argv[4] if len(sys.argv) > 4 else default_bin)
+        sa, sb = [ort.InferenceSession(m, providers=['CPUExecutionProvider']) for m in (a, b)]
+        same = True
+        for q in QUESTIONS:
+            ra, rb = ask_step(sa, q, w), ask_step(sb, q, w)
+            same &= ra == rb
+            print('%-40s -> %s%s' % (q, ra, '' if ra == rb else '   <> ' + rb))
+        print('same answers' if same else 'DIFFERENT answers')
 
     elif cmd == 'ask-step':
         import onnxruntime as ort
