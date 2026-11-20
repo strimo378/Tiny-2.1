@@ -12,6 +12,13 @@ installed, tiny2.pt can be given instead for full-precision weights.
   python export_onnx.py export-step --kv8      (tiny2_step_kv8.onnx)
   python export_onnx.py compare-step tiny2_step.onnx tiny2_step_row.onnx
 
+--cform models the 8-bit weights the way matvec() in the C ports does it:
+the bytes are added up and the row scale is applied to the sum, not to the
+table (Cast + MatMul + Mul instead of DequantizeLinear + MatMul).  Only
+meaningful with --int8.  It is the faithful model of the C arithmetic and
+it costs nothing, but it buys nothing either - MODELS.md measures both
+claims it was built to test and refutes them.
+
 --row takes the KV cache as input only and gives the new row out, so the
 graph never copies the cache.  --kv8 keeps that cache as int8 with one
 scale per head of every row, 112 KB instead of 384 KB; it implies --row.
@@ -189,7 +196,7 @@ def forward_numpy(w, ids):
 
 
 # ---------------------------------------------------------------- ONNX graph
-def export(w, path, q8=False):
+def export(w, path, q8=False, cform=False):
     from onnx import TensorProto, checker, helper, numpy_helper, save
 
     init, nodes = [], []
@@ -226,15 +233,43 @@ def export(w, path, q8=False):
     def table(tag, arr, key, transpose):
         """A weight table as the graph wants it: [in, out] for a MatMul
         (transpose=True) or [rows, cols] for a Gather.  The row scales always
-        belong to the first axis of `arr`, so the axis moves with it."""
+        belong to the first axis of `arr`, so the axis moves with it.
+
+        Returns the tensor and, in the C form, the row scales to be applied
+        after the dot product instead of to the table."""
         if not q8:
-            return const(tag + '/w', np.ascontiguousarray(arr.T if transpose else arr))
+            return const(tag + '/w',
+                         np.ascontiguousarray(arr.T if transpose else arr)), None
         q, scale = int8_rows(w, key, arr)
-        return dequant(tag, np.ascontiguousarray(q.T if transpose else q), scale,
-                       1 if transpose else 0)
+        qt = np.ascontiguousarray(q.T if transpose else q)
+        if not cform:
+            return dequant(tag, qt, scale, 1 if transpose else 0), None
+        # matvec() in the C ports adds up the bytes and scales the sum once
+        # per row, so the scale stays out of the table
+        return (node('Cast', [const(tag + '/q8', qt)], tag + '/f8',
+                     to=TensorProto.FLOAT),
+                const(tag + '/rs', scale))
 
     def linear(x, weight, tag):                  # weight is [out, in] like torch
-        return node('MatMul', [x, table(tag, weight, tag.replace('/', '.'), True)], tag)
+        t, scale = table(tag, weight, tag.replace('/', '.'), True)
+        y = node('MatMul', [x, t], tag if scale is None else tag + '/sum')
+        return y if scale is None else node('Mul', [y, scale], tag)
+
+    def column(name, axes):                      # [..., n] -> [..., n, 1]
+        if OPSET < 13:                           # axes was an attribute then
+            return node('Unsqueeze', [name], name + '/col', axes=axes)
+        return node('Unsqueeze', [name, const(name + '/axes', np.array(axes, np.int64))],
+                    name + '/col')
+
+    def lookup(tag, arr, key, idx, out):
+        """One row of a table.  In the C form the row is gathered as bytes and
+        scaled afterwards, the way the C ports read the embedding."""
+        t, scale = table(tag, arr, key, False)
+        row = node('Gather', [t, idx], out if scale is None else out + '/q8')
+        if scale is None:
+            return row
+        return node('Mul', [row, column(node('Gather', [scale, idx], out + '/scale'),
+                                        [-1])], out)
 
     # positions 0..T-1 and the causal mask, both taken from the input shape
     shape = node('Shape', ['ids'], 'shape')
@@ -252,8 +287,8 @@ def export(w, path, q8=False):
     sub = node('Sub', [tril, const('mask/one', np.float32(1.0))], 'mask/sub')
     mask = node('Mul', [sub, const('mask/big', np.float32(1e9))], 'mask')
 
-    emb_lookup = node('Gather', [table('emb', w.emb, 'emb', False), 'ids'], 'emb/lookup')
-    pos_lookup = node('Gather', [table('pos', w.pos, 'pos', False), positions], 'pos/lookup')
+    emb_lookup = lookup('emb', w.emb, 'emb', 'ids', 'emb/lookup')
+    pos_lookup = lookup('pos', w.pos, 'pos', positions, 'pos/lookup')
     x = node('Add', [emb_lookup, pos_lookup], 'x0')
 
     to_heads = const('heads/shape', np.array([0, 0, w.H, w.HD], np.int64))
@@ -283,7 +318,10 @@ def export(w, path, q8=False):
         x = node('Add', [x, linear(hid, b['f2'], p + '/f2')], p + '/res2')
 
     final = rmsnorm(x, w.nf, 'nf')
-    node('MatMul', [final, table('unemb', w.emb, 'emb', True)], 'logits')
+    unemb, unemb_scale = table('unemb', w.emb, 'emb', True)
+    final = node('MatMul', [final, unemb], 'logits' if unemb_scale is None else 'logits/sum')
+    if unemb_scale is not None:
+        node('Mul', [final, unemb_scale], 'logits')
 
     graph = helper.make_graph(
         nodes, 'tiny2',
@@ -303,7 +341,7 @@ def export(w, path, q8=False):
 
 
 # ---------------------------------------------------------------- ONNX step graph
-def export_step(w, path, q8=False, row=False, kv8=False):
+def export_step(w, path, q8=False, row=False, kv8=False, cform=False):
     """One letter per call, with the memory of earlier letters passed in and
     out as tensors: the shape an embedded inference engine wants.
 
@@ -388,14 +426,45 @@ def export_step(w, path, q8=False, row=False, kv8=False):
         return qname, scale
 
     def table(tag, arr, key, transpose):
+        """A weight table as the graph wants it: [in, out] for a MatMul
+        (transpose=True) or [rows, cols] for a Gather.  The row scales always
+        belong to the first axis of `arr`, so the axis moves with it.
+
+        Returns the tensor and, in the C form, the row scales to be applied
+        after the dot product instead of to the table."""
         if not q8:
-            return const(tag + '/w', np.ascontiguousarray(arr.T if transpose else arr))
+            return const(tag + '/w',
+                         np.ascontiguousarray(arr.T if transpose else arr)), None
         q, scale = int8_rows(w, key, arr)
-        return dequant(tag, np.ascontiguousarray(q.T if transpose else q), scale,
-                       1 if transpose else 0)
+        qt = np.ascontiguousarray(q.T if transpose else q)
+        if not cform:
+            return dequant(tag, qt, scale, 1 if transpose else 0), None
+        # matvec() in the C ports adds up the bytes and scales the sum once
+        # per row, so the scale stays out of the table
+        return (node('Cast', [const(tag + '/q8', qt)], tag + '/f8',
+                     to=TensorProto.FLOAT),
+                const(tag + '/rs', scale))
 
     def linear(x, weight, tag):                  # weight is [out, in] like torch
-        return node('MatMul', [x, table(tag, weight, tag.replace('/', '.'), True)], tag)
+        t, scale = table(tag, weight, tag.replace('/', '.'), True)
+        y = node('MatMul', [x, t], tag if scale is None else tag + '/sum')
+        return y if scale is None else node('Mul', [y, scale], tag)
+
+    def column(name, axes):                      # [..., n] -> [..., n, 1]
+        if OPSET < 13:                           # axes was an attribute then
+            return node('Unsqueeze', [name], name + '/col', axes=axes)
+        return node('Unsqueeze', [name, const(name + '/axes', np.array(axes, np.int64))],
+                    name + '/col')
+
+    def lookup(tag, arr, key, idx, out):
+        """One row of a table.  In the C form the row is gathered as bytes and
+        scaled afterwards, the way the C ports read the embedding."""
+        t, scale = table(tag, arr, key, False)
+        row = node('Gather', [t, idx], out if scale is None else out + '/q8')
+        if scale is None:
+            return row
+        return node('Mul', [row, column(node('Gather', [scale, idx], out + '/scale'),
+                                        [-1])], out)
 
     H, HD, D = w.H, w.HD, w.D
     full_shape = [H, CTX, HD]                    # the whole cache, one layer
@@ -420,10 +489,8 @@ def export_step(w, path, q8=False, row=False, kv8=False):
         keep3 = node('Reshape', [keep, const('keep/shape', np.array([1, CTX, 1], np.int64))],
                      'keep3')
 
-    x = node('Add', [node('Gather', [table('emb', w.emb, 'emb', False), 'tok'],
-                          'emb/lookup'),
-                     node('Gather', [table('pos_emb', w.pos, 'pos', False), 'pos'],
-                          'pos/lookup')], 'x0')
+    x = node('Add', [lookup('emb', w.emb, 'emb', 'tok', 'emb/lookup'),
+                     lookup('pos_emb', w.pos, 'pos', 'pos', 'pos/lookup')], 'x0')
 
     to_heads = const('to_heads', np.array([H, 1, HD], np.int64))
     to_flat = const('to_flat', np.array([1, D], np.int64))
@@ -514,8 +581,11 @@ def export_step(w, path, q8=False, row=False, kv8=False):
         hid = node('Relu', [linear(h2, b['f1'], p + '/f1')], p + '/relu')
         x = node('Add', [x, linear(hid, b['f2'], p + '/f2')], p + '/res2')
 
-    node('MatMul', [rmsnorm(x, w.nf, 'nf'), table('unemb', w.emb, 'emb', True)],
-         'logits')
+    unemb, unemb_scale = table('unemb', w.emb, 'emb', True)
+    out = node('MatMul', [rmsnorm(x, w.nf, 'nf'), unemb],
+               'logits' if unemb_scale is None else 'logits/sum')
+    if unemb_scale is not None:
+        node('Mul', [out, unemb_scale], 'logits')
 
     cache_in = []
     for i in range(w.L):
@@ -614,6 +684,9 @@ def main():
     if kv8:
         sys.argv.remove('--kv8')
         row = True
+    cform = '--cform' in sys.argv
+    if cform:
+        sys.argv.remove('--cform')
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''
     here = os.path.dirname(os.path.abspath(__file__))
     default_bin = os.path.normpath(os.path.join(here, os.pardir, 'dos', 'TINY.BIN'))
@@ -622,15 +695,16 @@ def main():
     if cmd == 'export-step':
         src = sys.argv[2] if len(sys.argv) > 2 else default_bin
         dst = sys.argv[3] if len(sys.argv) > 3 else os.path.join(
-            here, 'tiny2_step%s%s%s.onnx' % ('_row' if row and not kv8 else '',
-                                             '_kv8' if kv8 else '',
-                                             '_int8' if q8 else ''))
+            here, 'tiny2_step%s%s%s%s.onnx' % ('_row' if row and not kv8 else '',
+                                               '_kv8' if kv8 else '',
+                                               '_int8' if q8 else '',
+                                               '_cform' if cform else ''))
         w = load_weights(src)
         print('read %s: D=%d L=%d H=%d HID=%d' % (os.path.basename(src), w.D, w.L, w.H, w.HID))
-        print('wrote %s, %d bytes, opset %d%s%s%s'
-              % (dst, export_step(w, dst, q8, row, kv8), OPSET,
+        print('wrote %s, %d bytes, opset %d%s%s%s%s'
+              % (dst, export_step(w, dst, q8, row, kv8, cform), OPSET,
                  ', 8-bit weights' if q8 else '', ', new row out' if row else '',
-                 ', int8 cache' if kv8 else ''))
+                 ', int8 cache' if kv8 else '', ', C form' if cform else ''))
 
     elif cmd == 'compare-step':
         import onnxruntime as ort
@@ -655,13 +729,14 @@ def main():
     elif cmd == 'export':
         src = sys.argv[2] if len(sys.argv) > 2 else default_bin
         dst = sys.argv[3] if len(sys.argv) > 3 else (
-            os.path.join(here, 'tiny2_int8.onnx') if q8 else default_onnx)
+            os.path.join(here, 'tiny2_int8%s.onnx' % ('_cform' if cform else ''))
+            if q8 else default_onnx)
         w = load_weights(src)
         print('read %s: D=%d L=%d H=%d HID=%d, %d parameters'
               % (os.path.basename(src), w.D, w.L, w.H, w.HID, param_count(w)))
-        print('wrote %s, %d bytes, opset %d%s'
-              % (dst, export(w, dst, q8), OPSET,
-                 ', 8-bit weights' if q8 else ''))
+        print('wrote %s, %d bytes, opset %d%s%s'
+              % (dst, export(w, dst, q8, cform), OPSET,
+                 ', 8-bit weights' if q8 else '', ', C form' if cform else ''))
 
     elif cmd == 'ask':
         import onnxruntime as ort

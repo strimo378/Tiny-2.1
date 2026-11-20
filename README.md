@@ -107,7 +107,7 @@ and `--kv8` for that cache kept as int8 with one scale per head, 112 KB
 instead of 384 KB. The int8 cache costs about one answer in sixty, and
 int8 weights on top of it cost nothing further.
 
-All ten exported models are checked in under `training/`.
+All eleven exported models are checked in under `training/`.
 [`training/MODELS.md`](training/MODELS.md) says what each one is, how
 accurate it is against the float32 one, and how to reproduce it.
 

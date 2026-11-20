@@ -54,7 +54,7 @@ export-step also takes --row (the cache is only read, the new row comes
 out) and --kv8 (that cache as int8 with one scale per head, 112 KB instead
 of 384 KB, which costs about one answer in sixty).
 
-The ten exported models are checked in next to this file. MODELS.md says
+The eleven exported models are checked in next to this file. MODELS.md says
 what each one is, how good it is, and how to regenerate it.
 
 How TINY 2 was trained: started from the version 1 network (grown from 3 to

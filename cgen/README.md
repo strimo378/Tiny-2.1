@@ -228,6 +228,18 @@ them to. emx-onnx-cgen compiles opset 28 without complaint. `--opset N` on
 either export picks another one; below 18 the exporter writes `ReduceMean`
 with `axes` as an attribute instead of an input.
 
+### Why the 8-bit build is the slow one
+
+`DequantizeLinear` on a constant table is not folded away: the generated
+code builds a float32 copy of every table on every call, which is where
+the 1970 ms go. Modelling it the way `matvec()` in the C ports does it —
+add up the bytes, scale the sum once per row — does not help, because a
+`Cast` of a constant is materialized just the same (2110 ms, measured;
+`../training/MODELS.md` has the numbers and the generated declaration).
+The C port's speed is in its loop, which keeps no copy at all, and a graph
+cannot express a loop. A generator could choose to fuse it; this one does
+not yet.
+
 ## The cache, and what it could be
 
 The generated kernel takes the whole cache in and gives the whole updated
